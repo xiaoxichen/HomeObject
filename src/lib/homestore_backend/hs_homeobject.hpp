@@ -59,7 +59,8 @@ private:
                                                trace_id_t tid) const override;
     BlobManager::NullAsyncResult _del_blob(ShardInfo const&, blob_id_t, trace_id_t tid) override;
 
-    PGManager::NullAsyncResult _create_pg(PGInfo&& pg_info, std::set< peer_id_t > const& peers, trace_id_t tid) override;
+    PGManager::NullAsyncResult _create_pg(PGInfo&& pg_info, std::set< peer_id_t > const& peers,
+                                          trace_id_t tid) override;
     PGManager::NullAsyncResult _replace_member(pg_id_t id, peer_id_t const& old_member, PGMember const& new_member,
                                                uint32_t commit_quorum, trace_id_t tid) override;
 
@@ -435,9 +436,11 @@ public:
 
     struct PGBlobIterator {
         struct blob_read_result {
+            blob_id_t blob_id_;
             sisl::io_blob_safe blob_;
             ResyncBlobState state_;
-	    blob_read_result(sisl::io_blob_safe&& blob, ResyncBlobState state): blob_(std::move(blob)), state_(state) {}
+            blob_read_result(blob_id_t blob_id, sisl::io_blob_safe&& blob, ResyncBlobState state) :
+                    blob_id_(blob_id), blob_(std::move(blob)), state_(state) {}
         };
         PGBlobIterator(HSHomeObject& home_obj, homestore::group_id_t group_id, uint64_t upto_lsn = 0);
         PG* get_pg_metadata();
@@ -639,7 +642,7 @@ private:
     static ShardInfo deserialize_shard_info(const char* shard_info_str, size_t size);
     static std::string serialize_shard_info(const ShardInfo& info);
     void local_create_shard(ShardInfo shard_info, homestore::chunk_num_t v_chunk_id, homestore::chunk_num_t p_chunk_id,
-                            homestore::blk_count_t blk_count, trace_id_t tid=0);
+                            homestore::blk_count_t blk_count, trace_id_t tid = 0);
     void add_new_shard_to_map(ShardPtr&& shard);
     void update_shard_in_map(const ShardInfo& shard_info);
 
@@ -812,7 +815,7 @@ public:
                             const homestore::MultiBlkId& pbas, cintrusive< homestore::repl_req_ctx >& hs_ctx);
     void on_blob_del_commit(int64_t lsn, sisl::blob const& header, sisl::blob const& key,
                             cintrusive< homestore::repl_req_ctx >& hs_ctx);
-    bool local_add_blob_info(pg_id_t pg_id, BlobInfo const& blob_info, trace_id_t tid=0);
+    bool local_add_blob_info(pg_id_t pg_id, BlobInfo const& blob_info, trace_id_t tid = 0);
     homestore::ReplResult< homestore::blk_alloc_hints >
     blob_put_get_blk_alloc_hints(sisl::blob const& header, cintrusive< homestore::repl_req_ctx >& ctx);
     void compute_blob_payload_hash(BlobHeader::HashAlgorithm algorithm, const uint8_t* blob_bytes, size_t blob_size,
@@ -902,13 +905,13 @@ private:
 
     // only leader will call incr and decr pending request num
     void incr_pending_request_num() const {
-        uint64_t now=pending_request_num.fetch_add(1);
+        uint64_t now = pending_request_num.fetch_add(1);
         LOGT("inc pending req, was {}", now);
     }
-        void decr_pending_request_num() const {
+    void decr_pending_request_num() const {
         uint64_t now = pending_request_num.fetch_sub(1);
         LOGT("desc pending req, was {}", now);
-        DEBUG_ASSERT(now>0, "pending == 0 ");
+        DEBUG_ASSERT(now > 0, "pending == 0 ");
     }
 };
 
