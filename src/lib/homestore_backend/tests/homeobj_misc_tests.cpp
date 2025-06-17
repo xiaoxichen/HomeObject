@@ -305,7 +305,7 @@ TEST_F(HomeObjectFixture, SnapshotReceiveHandler) {
                 // Construct raw blob buffer
                 auto blob = build_blob(cur_blob_id);
                 const auto aligned_hdr_size =
-                    sisl::round_up(sizeof(HSHomeObject::BlobHeader) + blob.user_key.size(), io_align);
+                    sisl::round_up(sizeof(HSHomeObject::BlobHeader), io_align);
                 sisl::io_blob_safe blob_raw(aligned_hdr_size + blob.body.size(), io_align);
                 HSHomeObject::BlobHeader hdr;
                 hdr.type = HSHomeObject::DataHeader::data_type_t::BLOB_INFO;
@@ -316,18 +316,18 @@ TEST_F(HomeObjectFixture, SnapshotReceiveHandler) {
                 hdr.user_key_size = blob.user_key.size();
                 hdr.object_offset = blob.object_off;
                 hdr.data_offset = aligned_hdr_size;
+                if (!blob.user_key.empty()) {
+                    std::memcpy(hdr.user_key , blob.user_key.data(),
+                                blob.user_key.size());
+                }
                 _obj_inst->compute_blob_payload_hash(hdr.hash_algorithm, blob.body.cbytes(), blob.body.size(),
-                                                     reinterpret_cast< uint8_t* >(blob.user_key.data()),
-                                                     blob.user_key.size(), hdr.hash,
+                                                     hdr.user_key,
+                                                     hdr.user_key_size, hdr.hash,
                                                      HSHomeObject::BlobHeader::blob_max_hash_len);
                 hdr.seal();
 
                 std::memcpy(blob_raw.bytes(), &hdr, sizeof(HSHomeObject::BlobHeader));
-                if (!blob.user_key.empty()) {
-                    std::memcpy((blob_raw.bytes() + sizeof(HSHomeObject::BlobHeader)), blob.user_key.data(),
-                                blob.user_key.size());
-                }
-                std::memcpy(blob_raw.bytes() + aligned_hdr_size, blob.body.cbytes(), blob.body.size());
+                std::memcpy(blob_raw.bytes() + hdr.data_offset, blob.body.cbytes(), blob.body.size());
 
                 // Simulate blob data corruption - tamper with random bytes
                 if (is_corrupted_batch || blob_state == ResyncBlobState::CORRUPTED) {
