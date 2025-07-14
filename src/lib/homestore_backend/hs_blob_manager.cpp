@@ -310,7 +310,7 @@ BlobManager::AsyncResult< Blob > HSHomeObject::_get_blob(ShardInfo const& shard,
         return folly::makeUnexpected(BlobError(BlobErrorCode::RETRY_REQUEST));
     }
 
-    BLOGD(tid, shard.id, blob_id, "Blob Get request: pg={}, group={}, shard=0x{:x}, blob={}, offset={}, len={}", pg_id,
+    BLOGD(tid, shard.id, blob_id, "Blob Get request: pd={}, group={}, shard=0x{:x}, blob={}, offset={}, len={}", pg_id,
           repl_dev->group_id(), shard.id, blob_id, req_offset, req_len);
     auto r = get_blob_from_index_table(index_table, shard.id, blob_id);
     if (!r) {
@@ -327,6 +327,7 @@ BlobManager::AsyncResult< Blob > HSHomeObject::_get_blob_data(const shared< home
                                                               uint64_t req_offset, uint64_t req_len,
                                                               const homestore::MultiBlkId& blkid,
                                                               trace_id_t tid) const {
+    RELEASE_ASSERT(blkid.num_pieces() == 1, "blkid should only have one pieces for HO use case");
     auto const total_size = blkid.blk_count() * repl_dev->get_blk_size();
     sisl::io_blob_safe read_buf{total_size, io_align};
 
@@ -334,60 +335,148 @@ BlobManager::AsyncResult< Blob > HSHomeObject::_get_blob_data(const shared< home
     sgs.size = total_size;
     sgs.iovs.emplace_back(iovec{.iov_base = read_buf.bytes(), .iov_len = read_buf.size()});
 
-    BLOGD(tid, shard_id, blob_id, "Reading from blkid={} to buf={}", blkid.to_string(), (void*)read_buf.bytes());
-    return repl_dev->async_read(blkid, sgs, total_size)
-        .thenValue([this, tid, blob_id, shard_id, req_len, req_offset, blkid, repl_dev,
-                    read_buf = std::move(read_buf)](auto&& result) mutable -> BlobManager::AsyncResult< Blob > {
-            if (result) {
-                BLOGE(tid, shard_id, blob_id, "Failed to get blob: err={}", blob_id, shard_id, result.value());
-                decr_pending_request_num();
-                return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
-            }
+    bool is_partial_read = (req_offset != 0);
 
-            BlobHeader const* header = r_cast< BlobHeader const* >(read_buf.cbytes());
-            if (!header->valid()) {
-                BLOGE(tid, shard_id, blob_id, "Invalid header found: [header={}]", header->to_string());
-                decr_pending_request_num();
-                return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
-            }
+    auto adjusted_blkid;
 
-            if (header->shard_id != shard_id) {
-                BLOGE(tid, shard_id, blob_id, "Invalid shard_id in header: [header={}]", header->to_string());
-                decr_pending_request_num();
-                return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
-            }
-
-            std::string user_key = std::string((const char*)header->user_key, (size_t)header->user_key_size);
-
-            uint8_t const* blob_bytes = read_buf.bytes() + header->data_offset;
-            uint8_t computed_hash[BlobHeader::blob_max_hash_len]{};
-            compute_blob_payload_hash(header->hash_algorithm, blob_bytes, header->blob_size,
-                                      uintptr_cast(user_key.data()), header->user_key_size, computed_hash,
-                                      BlobHeader::blob_max_hash_len);
-            if (std::memcmp(computed_hash, header->hash, BlobHeader::blob_max_hash_len) != 0) {
-                BLOGE(tid, shard_id, blob_id, "Hash mismatch header, [header={}] [computed={:np}]", header->to_string(),
-                      spdlog::to_hex(computed_hash, computed_hash + BlobHeader::blob_max_hash_len));
-                decr_pending_request_num();
-                return folly::makeUnexpected(BlobError(BlobErrorCode::CHECKSUM_MISMATCH));
-            }
-
-            if (req_offset + req_len > header->blob_size) {
-                BLOGE(tid, shard_id, blob_id, "Invalid offset length requested in get blob offset={} len={} size={}",
-                      req_offset, req_len, header->blob_size);
-                decr_pending_request_num();
-                return folly::makeUnexpected(BlobError(BlobErrorCode::INVALID_ARG));
-            }
-
-            // Copy the blob bytes from the offset. If request len is 0, take the
-            // whole blob size else copy only the request length.
-            auto res_len = req_len == 0 ? header->blob_size - req_offset : req_len;
-            auto body = sisl::io_blob_safe(res_len);
-            std::memcpy(body.bytes(), blob_bytes + req_offset, res_len);
-
-            BLOGD(tid, shard_id, blob_id, "Blob get success: blkid={}", blkid.to_string());
+    struct blob_read_data {
+        std::error_code ec;
+        std::string user_key;
+        uint64_t object_offset;
+        sisl::io_blob_safe buf;
+    };
+    auto validate_header = (BlobHeader const* header) -> bool {
+        if (!header->valid()) {
+            BLOGE(tid, shard_id, blob_id, "Invalid header found: [header={}]", header->to_string());
             decr_pending_request_num();
-            return Blob(std::move(body), std::move(user_key), header->object_offset, repl_dev->get_leader_id());
-        });
+            return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+        }
+
+        if (header->shard_id != shard_id) {
+            BLOGE(tid, shard_id, blob_id, "Invalid shard_id in header: [header={}]", header->to_string());
+            decr_pending_request_num();
+            return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+        }
+
+
+    };
+    folly::Future< read_data > data_fut;
+    if (is_partial_read) {
+        // read header
+        auto s_blkid = blkid.to_single_blkid();
+        homestore::MultiBlkId header_blkid;
+        header_blkid.add(s_blkid.blk_num(), 1, s_blkid.chunk_num());
+        sisl::sg_list header_sg;
+        auto header_disk_bytes = 1 * repl_dev->get_blk_size();
+        header_sg.size = header_disk_bytes;
+        header_sg.iovs.emplace_back(iovec{.iov_base = read_buf.bytes(), .iov_len = header_disk_bytes});
+        auto header_rc = repl_dev->async_read(adjusted_blkid, header_sg, read_size).get();
+        if (header_rc) {
+            BLOGE(tid, shard_id, blob_id, "Failed to get blob: err={}", blob_id, shard_id, result.value());
+            decr_pending_request_num();
+            return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+        }
+
+        BlobHeader const* header = r_cast< BlobHeader const* >(read_buf.cbytes());
+
+        if (!validate_header(header)) {
+            BLOGE(tid, shard_id, blob_id, "Invalid header found: [header={}]", header->to_string());
+            decr_pending_request_num();
+            return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+        }
+
+        std::string user_key = std::string((const char*)header->user_key, (size_t)header->user_key_size);
+
+
+        // adjust blkid based on req_offset/req_len
+        // FIXME: adjust blkid based on block_checksum
+
+        auto s_blkid = blkid.to_single_blkid();
+        auto start_blk = req_offset / repl_dev->get_blk_size() + s_blkid.blk_num() + 1; // skip the header
+        auto adjusted_offset = req_offset % repl_dev->get_blk_size();
+        auto end_blk = (req_offset + req_len) / repl_dev->get_blk_size() + s_blkid.blk_num() + 1; // skip header
+        auto blk_cnt = end_blk - start_blk + 1;
+        adjusted_blkid.add(start_blk, blk_cnt, s_blkid.chunk_num());
+        data_fut =
+            repl_dev->async_read(adjusted_blkid, sgs, read_size)
+                .thenValue([this, tid, blob_id, shard_id, req_len, req_offset, blkid, repl_dev, user_key
+                            read_buf = std::move(read_buf)](auto&& result) mutable -> folly::Future< blob_read_data > {
+                    if (result) {
+                        BLOGE(tid, shard_id, blob_id, "Failed to get blob: err={}", blob_id, shard_id, result.value());
+                        decr_pending_request_num();
+                        return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+                    }
+                    auto body = sisl::io_blob_safe(req_len);
+                    std::memcpy(body.bytes(), read_buf.cbytes() + adjusted_offset, req_len);
+                    blob_read_data res {.user_key = user_key, .ec = result, object_offset=header->object_offset, .buf = std::move(body)};
+                });
+
+
+    } else {
+        // read full
+        data_fut =
+            repl_dev->async_read(adjusted_blkid, sgs, read_size)
+                .thenValue([this, tid, blob_id, shard_id, req_len, req_offset, blkid, repl_dev,
+                            read_buf = std::move(read_buf)](auto&& result) mutable -> folly::Future< blob_read_data > {
+                    // read from the start of blob, header was read out.
+
+                    if (result) {
+                        BLOGE(tid, shard_id, blob_id, "Failed to get blob: err={}", blob_id, shard_id, result.value());
+                        decr_pending_request_num();
+                        return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+                    }
+                    BlobHeader const* header = r_cast< BlobHeader const* >(read_buf.cbytes());
+                    if (!validate_header(header)) {
+                        BLOGE(tid, shard_id, blob_id, "Invalid header found: [header={}]", header->to_string());
+                        decr_pending_request_num();
+                        return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+                    }
+                    std::string user_key = std::string((const char*)header->user_key, (size_t)header->user_key_size);
+
+                    uint8_t const* blob_bytes = read_buf.bytes() + header->data_offset;
+                    uint8_t computed_hash[BlobHeader::blob_max_hash_len]{};
+                    compute_blob_payload_hash(header->hash_algorithm, blob_bytes, header->blob_size,
+                                              uintptr_cast(user_key.data()), header->user_key_size, computed_hash,
+                                              BlobHeader::blob_max_hash_len);
+                    if (std::memcmp(computed_hash, header->hash, BlobHeader::blob_max_hash_len) != 0) {
+                        BLOGE(tid, shard_id, blob_id, "Hash mismatch header, [header={}] [computed={:np}]",
+                              header->to_string(),
+                              spdlog::to_hex(computed_hash, computed_hash + BlobHeader::blob_max_hash_len));
+                        decr_pending_request_num();
+                        return folly::makeUnexpected(BlobError(BlobErrorCode::CHECKSUM_MISMATCH));
+                    }
+                    if (req_offset + req_len > header->blob_size) {
+                        BLOGE(tid, shard_id, blob_id,
+                              "Invalid offset length requested in get blob offset={} len={} size={}", req_offset, req_len,
+                              header->blob_size);
+                        decr_pending_request_num();
+                        return folly::makeUnexpected(BlobError(BlobErrorCode::INVALID_ARG));
+                    }
+                    // Copy the blob bytes from the offset. If request len is 0, take the
+                    // whole blob size else copy only the request length.
+                    auto res_len = req_len;
+                    auto body = sisl::io_blob_safe(res_len);
+                    std::memcpy(body.bytes(), blob_bytes + req_offset, res_len);
+
+                    blob_read_data res {.user_key = user_key, .ec = result, object_offset=header->object_offset, .buf = std::move(body)};
+                    return res;
+                });
+    }
+
+    return data_fut.thenValue((auto&& result) mutable->BlobManager::AsyncResult< Blob > {
+        if (result.ec) {
+            BLOGE(tid, shard_id, blob_id, "Failed to get blob: err={}", blob_id, shard_id, result.value());
+            decr_pending_request_num();
+            return folly::makeUnexpected(BlobError(BlobErrorCode::READ_FAILED));
+        }
+        auto res_len = req_len;
+        auto body = sisl::io_blob_safe(res_len);
+        std::memcpy(body.bytes(), blob_bytes + req_offset, res_len);
+
+        BLOGD(tid, blob_id, shard_id, "Blob get success: blkid={}", blkid.to_string());
+        decr_pending_request_num();
+        return Blob(std::move(result.buf), std::move(result.user_key), result.object_offset, repl_dev->get_leader_id());
+    });
 }
 
 homestore::ReplResult< homestore::blk_alloc_hints >
@@ -429,9 +518,9 @@ HSHomeObject::blob_put_get_blk_alloc_hints(sisl::blob const& header, cintrusive<
         return folly::makeUnexpected(homestore::ReplServiceError::RESULT_NOT_EXIST_YET);
     }
 
-    auto hs_shard = d_cast< HS_Shard* >((*shard_iter->second).get());
-
     homestore::blk_alloc_hints hints;
+
+    auto hs_shard = d_cast< HS_Shard* >((*shard_iter->second).get());
     hints.chunk_id_hint = hs_shard->sb_->p_chunk_id;
     if (hs_ctx->is_proposer()) { hints.reserved_blks = get_reserved_blks(); }
     BLOGD(tid, msg_header->shard_id, msg_header->blob_id, "Picked p_chunk_id={}, reserved_blks={}",
