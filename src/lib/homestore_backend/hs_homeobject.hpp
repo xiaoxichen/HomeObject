@@ -494,11 +494,49 @@ public:
             return ret;
         }
 
+        // User keys are embedded in single-line logs. A raw newline would split the record.
+        std::string log_user_key() const {
+            auto key = get_user_key().value_or("<null>");
+            for (char& c : key) {
+                if (c == '\n' || c == '\r') { c = ' '; }
+            }
+            return key;
+        }
+
+        // Print only the bytes the algorithm uses, as a contiguous hex string.
+        static std::string format_hash(HashAlgorithm algorithm, uint8_t const* bytes) {
+            size_t n = blob_max_hash_len;
+            switch (algorithm) {
+            case HashAlgorithm::NONE:
+                return "none";
+            case HashAlgorithm::CRC32:
+                n = sizeof(uint32_t);
+                break;
+            case HashAlgorithm::MD5:
+                n = 16;
+                break;
+            case HashAlgorithm::SHA1:
+                n = 20;
+                break;
+            default:
+                break;
+            }
+            static constexpr char hex[] = "0123456789abcdef";
+            std::string out;
+            out.reserve(2 + n * 2);
+            out.append("0x");
+            for (size_t i = 0; i < n; ++i) {
+                out.push_back(hex[bytes[i] >> 4]);
+                out.push_back(hex[bytes[i] & 0x0f]);
+            }
+            return out;
+        }
+
         std::string to_string() const {
             return fmt::format(
-                "magic={:#x} version={} shard={:#x} blob_size={} user_size={} algo={} hash={:np}, user_key={}", magic,
-                version, shard_id, blob_size, user_key_size, (uint8_t)hash_algorithm,
-                spdlog::to_hex(hash, hash + blob_max_hash_len), get_user_key().value_or("<null>"));
+                "magic={:#x} version={} shard={:#x} blob_id={} blob_size={} user_size={} algo={} hash={} user_key={}",
+                magic, version, shard_id, blob_id, blob_size, user_key_size, (uint8_t)hash_algorithm,
+                format_hash(hash_algorithm, hash), log_user_key());
         }
 
         bool valid() const {

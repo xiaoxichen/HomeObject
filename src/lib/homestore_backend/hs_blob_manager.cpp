@@ -784,8 +784,12 @@ BlobManager::Result< std::string > HSHomeObject::do_verify_blob(const void* blob
                               BlobHeader::blob_max_hash_len);
 
     if (std::memcmp(computed_hash, header->hash, BlobHeader::blob_max_hash_len) != 0) {
-        LOGE("Hash mismatch header, [header={}] [computed={:np}]", header->to_string(),
-             spdlog::to_hex(computed_hash, computed_hash + BlobHeader::blob_max_hash_len));
+        LOGE("Hash mismatch magic={:#x} version={} shard={:#x} blob_id={} blob_size={} user_size={} algo={} "
+             "stored={} computed={} user_key={}",
+             header->magic, header->version, header->shard_id, header->blob_id, header->blob_size,
+             header->user_key_size, (uint8_t)header->hash_algorithm,
+             BlobHeader::format_hash(header->hash_algorithm, header->hash),
+             BlobHeader::format_hash(header->hash_algorithm, computed_hash), header->log_user_key());
         return folly::makeUnexpected(BlobError(BlobErrorCode::CHECKSUM_MISMATCH));
     }
 
