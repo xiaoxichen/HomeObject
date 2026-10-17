@@ -494,13 +494,28 @@ public:
             return ret;
         }
 
-        // User keys are embedded in single-line logs. A raw newline would split the record.
+        // User keys are embedded in single-line logs. Escape breaks so the record stays one line.
         std::string log_user_key() const {
             auto key = get_user_key().value_or("<null>");
-            for (char& c : key) {
-                if (c == '\n' || c == '\r') { c = ' '; }
+            std::string out;
+            out.reserve(key.size());
+            for (char c : key) {
+                switch (c) {
+                case '\\':
+                    out.append("\\\\");
+                    break;
+                case '\n':
+                    out.append("\\n");
+                    break;
+                case '\r':
+                    out.append("\\r");
+                    break;
+                default:
+                    out.push_back(c);
+                    break;
+                }
             }
-            return key;
+            return out;
         }
 
         // Print only the bytes the algorithm uses, as a contiguous hex string.
