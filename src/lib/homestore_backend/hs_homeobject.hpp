@@ -496,7 +496,7 @@ public:
 
         std::string to_string() const {
             return fmt::format(
-                "magic={:#x} version={} shard={:#x} blob_size={} user_size={} algo={} hash={:np}, user_key={}\n", magic,
+                "magic={:#x} version={} shard={:#x} blob_size={} user_size={} algo={} hash={:np}, user_key={}", magic,
                 version, shard_id, blob_size, user_key_size, (uint8_t)hash_algorithm,
                 spdlog::to_hex(hash, hash + blob_max_hash_len), get_user_key().value_or("<null>"));
         }
